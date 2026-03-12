@@ -291,23 +291,193 @@ function gotoTab(tab) {
   if (tab!=='scan' && scanning) stopScanner();
 }
 
-// ── SCANNER (Native BarcodeDetector — no external libraries) ──
+// ── BARCODE DECODER (Code128 / EAN-13 / EAN-8 / UPC-A / Code39) ──
+// Pure JS canvas-based decoder — no external libraries, works on all iOS versions
+
+function decodeFrame(imageData) {
+  const w = imageData.width, h = imageData.height;
+  const d = imageData.data;
+  // Sample multiple horizontal scan lines across the middle third of the image
+  const results = [];
+  for (let row = Math.floor(h*0.35); row < Math.floor(h*0.65); row += 4) {
+    // Convert row to grayscale + threshold
+    const pixels = [];
+    for (let x = 0; x < w; x++) {
+      const i = (row * w + x) * 4;
+      const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+      pixels.push(gray);
+    }
+    // Adaptive threshold
+    const avg = pixels.reduce((a,b)=>a+b,0)/pixels.length;
+    const thresh = avg * 0.85;
+    const bits = pixels.map(p => p < thresh ? 1 : 0);
+    // Get runs of black/white
+    const runs = [];
+    let cur = bits[0], count = 1;
+    for (let x = 1; x < bits.length; x++) {
+      if (bits[x] === cur) count++;
+      else { runs.push({v:cur, n:count}); cur=bits[x]; count=1; }
+    }
+    runs.push({v:cur, n:count});
+
+    const r = tryCode128(runs) || tryEAN13(runs) || tryCode39(runs);
+    if (r) results.push(r);
+  }
+  if (!results.length) return null;
+  // Return most common result
+  const freq = {};
+  results.forEach(r => freq[r] = (freq[r]||0)+1);
+  return Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0];
+}
+
+function normalizeRuns(runs) {
+  // Only look at runs that are bars (dark=1)
+  const bars = runs.filter(r=>r.v===1);
+  if (!bars.length) return [];
+  const minW = Math.max(1, Math.min(...bars.map(r=>r.n)));
+  return runs.map(r=>({v:r.v, n:Math.max(1,Math.round(r.n/minW))}));
+}
+
+function tryCode128(runs) {
+  // Find quiet zone + start pattern
+  const norm = normalizeRuns(runs);
+  // Code128 start chars are 211412, 211214, 211232 (B is most common: 211214)
+  for (let i = 1; i < norm.length - 6; i++) {
+    const s = norm.slice(i, i+6);
+    const pat = s.map(r=>r.n).join('');
+    if (pat === '211214' || pat === '211412' || pat === '211232') {
+      // Found start — extract data runs in groups of 6
+      const dataBars = norm.slice(i+6);
+      const chars = [];
+      let j = 0;
+      while (j + 5 < dataBars.length) {
+        const g = dataBars.slice(j, j+6).map(r=>r.n).join('');
+        // Stop char is 2331112
+        if (dataBars.slice(j,j+7).map(r=>r.n).join('') === '2331112') break;
+        const val = CODE128_MAP[g];
+        if (val !== undefined) chars.push(val);
+        j += 6;
+      }
+      if (chars.length >= 2) return chars.join('');
+    }
+  }
+  return null;
+}
+
+// Subset B code128 value map (bar pattern -> ASCII)
+const CODE128_MAP = {
+  '212222':' ','222122':'!','222221':'"','121223':'#','121322':'$','131222':'%',
+  '122213':'&',"122312":"'",'132212':'(','221213':')','221312':'*','231212':'+',
+  '112232':',',"122132":'-','122231':'.','113222':'/','123122':'0','123221':'1',
+  '223211':'2','221132':'3','221231':'4','213212':'5','223112':'6','312131':'7',
+  '311222':'8','321122':'9','321221':':','312212':';','322112':'<','322211':'=',
+  '212123':'>','212321':'?','232121':'@','111323':'A','131123':'B','131321':'C',
+  '112313':'D','132113':'E','132311':'F','211313':'G','231113':'H','231311':'I',
+  '112133':'J','112331':'K','132131':'L','113123':'M','113321':'N','133121':'O',
+  '313121':'P','211331':'Q','231131':'R','213113':'S','213311':'T','213131':'U',
+  '311123':'V','311321':'W','331121':'X','312113':'Y','312311':'Z','332111':'[',
+  '314111':'\\','221411':']','431111':'^','111224':'_','111422':'`','121124':'a',
+  '121421':'b','141122':'c','141221':'d','112214':'e','112412':'f','122114':'g',
+  '122411':'h','142112':'i','142211':'j','241211':'k','221114':'l','413111':'m',
+  '241112':'n','134111':'o','111242':'p','121142':'q','121241':'r','114212':'s',
+  '114211':'t','112142':'u','112241':'v','114112':'w','111421':'x','121121':'y',
+  '212111':'z','111143':'{','111341':'|','131141':'}','114113':'~'
+};
+
+function tryEAN13(runs) {
+  const norm = normalizeRuns(runs);
+  // EAN-13: quiet(9+) + guard(111) + 6 digits(7 each) + mid(11111) + 6 digits + guard(111) + quiet
+  for (let i = 0; i < norm.length - 30; i++) {
+    // Look for left guard: 3 runs of width 1,1,1 alternating dark/light/dark
+    const g = norm.slice(i,i+3);
+    if (g.length===3 && g[0].v===1 && g[0].n===1 && g[1].n===1 && g[2].n===1) {
+      // Try to decode 12 digits (EAN-13 first digit is encoded in parity)
+      const digits = decodeEANDigits(norm, i+3, 12);
+      if (digits && digits.length === 12) {
+        // Compute check digit
+        const sum = digits.reduce((acc,d,idx)=>acc+(idx%2===0?d:d*3),0);
+        const check = (10 - (sum % 10)) % 10;
+        return digits.join('') + check;
+      }
+    }
+  }
+  return null;
+}
+
+const EAN_L = {'0001101':0,'0011001':1,'0010011':2,'0111101':3,'0100011':4,
+               '0110001':5,'0101111':6,'0111011':7,'0110111':8,'0001011':9};
+function decodeEANDigits(norm, start, count) {
+  const digits = [];
+  let pos = start;
+  for (let d = 0; d < count; d++) {
+    if (pos+3 >= norm.length) return null;
+    const bars = norm.slice(pos, pos+4).map(r=>r.n);
+    if (bars.length < 4) return null;
+    // Convert 4-bar group to 7-bit pattern
+    let bits = '';
+    for (let b = 0; b < 4; b++) {
+      const val = d%2===0 ? (norm[pos+b].v===0?'0':'1') : (norm[pos+b].v===1?'1':'0');
+      for (let k=0;k<Math.min(bars[b],3);k++) bits += (norm[pos+b].v===0?'0':'1');
+    }
+    bits = bits.substring(0,7).padEnd(7,'0');
+    const digit = EAN_L[bits];
+    if (digit === undefined) return null;
+    digits.push(digit);
+    pos += 4;
+    if (d === 5 && pos < norm.length) pos += 5; // skip mid guard
+  }
+  return digits;
+}
+
+function tryCode39(runs) {
+  const norm = normalizeRuns(runs);
+  const CODE39_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%';
+  // Each Code39 char = 9 elements: 5 bars + 4 spaces, narrow=1 wide=3
+  // Start/stop = '*' pattern: 100010111011101 (nwnnwnwwn)
+  const starPat = [1,0,0,0,1,0,1,1,1,0,1,1,1,0,1]; // not used directly
+  const result = [];
+  for (let i = 0; i < norm.length - 9; i++) {
+    if (norm[i].v !== 1) continue;
+    const grp = norm.slice(i, i+9);
+    if (grp.length < 9) break;
+    const widths = grp.map(r=>r.n<=1?0:1); // 0=narrow,1=wide
+    const key = widths.join('');
+    // Code39 valid patterns (bars at 0,2,4,6,8 — spaces at 1,3,5,7)
+    const CODE39_MAP = {
+      '000110100':'0','100100001':'1','001100001':'2','101100000':'3',
+      '000110001':'4','100110000':'5','001110000':'6','000100101':'7',
+      '100100100':'8','001100100':'9','100001001':'A','001001001':'B',
+      '101001000':'C','000011001':'D','100011000':'E','001011000':'F',
+      '000001101':'G','100001100':'H','001001100':'I','000011100':'J',
+      '100000011':'K','001000011':'L','101000010':'M','000010011':'N',
+      '100010010':'O','001010010':'P','000000111':'Q','100000110':'R',
+      '001000110':'S','000010110':'T','110000001':'U','011000001':'V',
+      '111000000':'W','010010001':'X','110010000':'Y','011010000':'Z',
+      '010000101':'-','110000100':'.','011000100':' ','010101000':'$',
+      '010100010':'/','010001010':'+','000101010':'%','010010100':'*'
+    };
+    const ch = CODE39_MAP[key];
+    if (ch === '*') { if (result.length > 0) return result.join(''); result.length=0; }
+    else if (ch) result.push(ch);
+  }
+  return result.length >= 2 ? result.join('') : null;
+}
+
+// ── SCANNER ──
 async function startScanner() {
   document.getElementById('scan-start-btn').style.display = 'none';
   document.getElementById('scan-hint').textContent = 'Hold barcode steady in the frame';
 
   try {
-    // Request camera — prefer back camera
     videoStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
     });
-
     const video = document.getElementById('preview');
     video.srcObject = videoStream;
     await video.play();
     scanning = true;
 
-    // Use native BarcodeDetector (supported in iOS 17+ Safari and Chrome/Android)
+    // Use native BarcodeDetector if available (iOS 17+), else use our canvas decoder
     if ('BarcodeDetector' in window) {
       barcodeDetector = new BarcodeDetector({
         formats: ['qr_code','ean_13','ean_8','code_128','code_39','code_93',
@@ -317,14 +487,24 @@ async function startScanner() {
         if (!scanning) return;
         try {
           const barcodes = await barcodeDetector.detect(video);
-          if (barcodes && barcodes.length > 0) {
-            onScanned(barcodes[0].rawValue);
-          }
+          if (barcodes && barcodes.length > 0) onScanned(barcodes[0].rawValue);
         } catch {}
-      }, 300);
+      }, 250);
     } else {
-      // BarcodeDetector not available — show manual entry fallback
-      showManualFallback();
+      // Canvas-based decoder for older iOS
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      scanInterval = setInterval(() => {
+        if (!scanning || video.readyState < 2) return;
+        canvas.width  = video.videoWidth  || 640;
+        canvas.height = video.videoHeight || 480;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        try {
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const result = decodeFrame(imageData);
+          if (result) onScanned(result);
+        } catch {}
+      }, 250);
     }
 
   } catch(e) {
@@ -341,23 +521,6 @@ function stopScanner() {
   barcodeDetector = null;
   const video = document.getElementById('preview');
   if (video) video.srcObject = null;
-}
-
-function showManualFallback() {
-  // BarcodeDetector not supported — offer manual barcode entry
-  document.getElementById('scan-hint').textContent = 'Auto-scan not supported — tap below to enter manually';
-  const wrap = document.getElementById('video-wrap');
-  const existing = document.getElementById('manual-btn');
-  if (existing) return;
-  const btn = document.createElement('button');
-  btn.id = 'manual-btn';
-  btn.textContent = '⌨️ Enter Barcode Manually';
-  btn.style.cssText = 'position:absolute;bottom:70px;left:50%;transform:translateX(-50%);background:var(--primary);color:#fff;border:none;border-radius:30px;padding:12px 24px;font-size:15px;font-weight:700;font-family:var(--sans);cursor:pointer;z-index:5;white-space:nowrap;';
-  btn.onclick = () => {
-    const code = prompt('Enter barcode number:');
-    if (code && code.trim()) onScanned(code.trim());
-  };
-  wrap.appendChild(btn);
 }
 
 function onScanned(text) {
