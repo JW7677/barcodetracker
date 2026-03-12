@@ -248,7 +248,7 @@
 <div class="toast" id="toast"></div>
 
 <!-- ZXing barcode library - better iOS support -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/zxing-js/0.20.0/zxing.min.js"></script>
+<script src="https://unpkg.com/@zxing/browser@latest"></script>
 <script>
 const STORAGE_KEY = 'bt_records_v2';
 let currentTab = 'scan';
@@ -256,6 +256,7 @@ let emailTab = 'user';
 let activeFilter = 'all';
 let pendingBarcode = '';
 let codeReader = null;
+let scanControls = null;
 let scanning = false;
 
 // ── STORAGE ──
@@ -296,22 +297,22 @@ async function startScanner() {
   document.getElementById('scan-start-btn').style.display = 'none';
 
   try {
-    // Use ZXing's BrowserMultiFormatReader — best cross-format support
-    codeReader = new ZXing.BrowserMultiFormatReader();
+    // Use ZXingBrowser's BrowserMultiFormatReader — best cross-format iOS support
+    codeReader = new ZXingBrowser.BrowserMultiFormatReader();
 
-    const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
+    const devices = await ZXingBrowser.BrowserCodeReader.listVideoInputDevices();
     // prefer back camera
     let deviceId = undefined;
-    if (devices.length > 1) {
+    if (devices && devices.length > 0) {
       const back = devices.find(d => /back|rear|environment/i.test(d.label));
       if (back) deviceId = back.deviceId;
-      else deviceId = devices[devices.length - 1].deviceId; // last is usually back
+      else if (devices.length > 1) deviceId = devices[devices.length - 1].deviceId;
     }
 
     scanning = true;
     document.getElementById('scan-hint').textContent = 'Hold barcode steady in the frame';
 
-    await codeReader.decodeFromVideoDevice(deviceId, 'preview', (result, err) => {
+    scanControls = await codeReader.decodeFromVideoDevice(deviceId, 'preview', (result, err) => {
       if (result) {
         const text = result.getText();
         if (text) onScanned(text);
@@ -327,10 +328,11 @@ async function startScanner() {
 }
 
 function stopScanner() {
-  if (codeReader) {
-    try { codeReader.reset(); } catch {}
-    codeReader = null;
+  if (scanControls) {
+    try { scanControls.stop(); } catch {}
+    scanControls = null;
   }
+  codeReader = null;
   scanning = false;
 }
 
